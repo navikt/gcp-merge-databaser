@@ -1,201 +1,205 @@
 # etterlatte-gcp-migrering
 
-Verktøy for å gjennomføre databasemigrering mellom Google Cloud SQL databaser på en sikker måte. 
+Verktøy for å gjennomføre databasemigrering mellom Google Cloud SQL databaser på en sikker måte.
 
-Med denne fremgangsmåten er det også mulig å velge spesifikke tabeller som skal migreres. Dette i motsetning til andre verktøy som kun tilbyr 
-migrering av hele databaser. 
+Med denne fremgangsmåten er det også mulig å velge spesifikke tabeller som skal migreres. Dette i motsetning til andre verktøy som kun tilbyr
+migrering av hele databaser.
 
-## Forarbeid gcp-application
-
-### 1. Start app for migrering
-
-Start pod'en som inneholder verktøyene ved å applye til ditt namespace:
-```
-kubectl apply -f gcloud.yaml
-```
-
-Obs merk at denne er begrenset til maks 512 mb.
-Om man deployer med en ugydlig config må man sjekke loggene til applikasjonsressursen evt serviceressursen som blir opprettet i 
+Obs merk at denne applikasjonen er begrenset til maks 512 mb.
+Om man deployer med en ugydlig config må man sjekke loggene til applikasjonsressursen evt serviceressursen som blir opprettet i
 tillegg til podden.
 
-### 2. Generer servicebruker
+## Plan for databasemigrering
 
-Hvis det allerede finnes en servicebruker kan denne benyttes. Hvis ikke kan det opprettes i GCP Console:
+Skal gjøres i dev før produksjon - alltid!
 
-https://console.cloud.google.com/iam-admin/serviceaccounts/create?walkthrough_id=iam--create-service-account
+## Forarbeid
 
-### 3. Opprett nøkkel for servicebruker
+1. Flytt all logikk og trafikk til målappen. Sørg for at alle apper går via den nye appen før databasen migreres. Dette deler migreringen i to uavhengige steg og gjør rollback enklere.
+2. Eksporter skjemadefinisjoner for tabellene som skal flyttes
+    ```
+    pg_dump -h localhost -p 5432 -U <BRUKER> -d <KILDEDATABASE> --schema-only --exclude-table-data=flyway_schema_history
+    ```
+3. Få opprettet skjema-innhold i den databasen man skal flytte data inn i (helst via Flyway)
 
-- Gå til [IAM & Admin / Service accounts](https://console.cloud.google.com/iam-admin/serviceaccounts)
-- Velg "actions" -> "Manage keys" -> "Add key"
-- JSON-tokenet som opprettes må så legges i `secret.yaml`.
+   Merk: Det kan være lurt å tenke på om man vi vil legge på indeksene i etterkant da
+   insert med hele tabellen sammen med indeksering kan ta lang tid. Sjekk indekstørrelse opp mot tabellstørrelse for
+   å avgjøre dette evt en test i dev/lokalt.
+4. Lag servicebruker i GCP med SQL admin-tilganger (hvis den ikke allerede finnes): https://console.cloud.google.com/iam-admin/serviceaccounts/create
+5. Legg til servicebrukeren manuelt i Cloud Console for BEGGE databaser:
 
+   Gå til: ```SQL instances → Users → Add user account```
 
-### 4. Apply secret
+   OBS: Sjekk hva eksisterende bruker  heter:
+    * Eksempel: ``migrering-user@<PROSJEKT_ID>.iam.gserviceaccount.com``
+6. Grant tilganger på kildedatabasen (helst via Flyway):
+    ```
+    GRANT USAGE ON SCHEMA public TO "cloudsqliamserviceaccount";   
+    GRANT SELECT ON ALL TABLES IN SCHEMA public TO "cloudsqliamserviceaccount";
+    GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO "cloudsqliamserviceaccount";
+   ```
+7. Grant tilganger på måldatabasen (helst via Flyway):
+    ```
+    GRANT USAGE ON SCHEMA public TO "cloudsqliamserviceaccount";
+    GRANT INSERT ON ALL TABLES IN SCHEMA public TO "cloudsqliamserviceaccount";
+    GRANT UPDATE ON ALL SEQUENCES IN SCHEMA public TO "cloudsqliamserviceaccount";
+    ```
+8. Verifiser at brukeren har riktige tilganger med kommandoen \dp i psql.
 
-Når stegene over er utført kan du kjøre:
+### Forarbeid - migreringspod
 
-```shell
-kubectl apply -f secret.yaml
+1. Klon repo:
+   ```
+   git clone https://github.com/navikt/gcp-merge-databaser
+   ```
+2. Generer nøkkel for servicebruker
+    * Gå til IAM → Service Accounts → Keys → Add key → JSON i GCP.
+    * Lim inn JSON-nøkkelen i secret.yaml.
+3. Apply secret for servicebruker:
+   ```
+   kubectl apply -f secret.yaml
+   ```
+4. Start migreringspod:
+   ```
+   kubectl apply -f gcloud.yaml
+   ```
+5. Oppdater network policy med riktige IP-adresser for BEGGE databaser. IP-adresser finner man i oversikten over databaseinstanser i GCP Console. Oppdater network-dev.yaml eller network-prod.yaml med riktige public IP-adresser.
+6. Apply network policy
+   ```
+   kubectl apply -f network-<dev/prod>.yaml
+   ```
+7. Restart pod slik at den leser inn secret og network policy
+    * ``kubectl scale deployment gcloud --replicas=0``
+    * Vent til pod er slått av, kjør deretter:
+    * ``kubectl scale deployment gcloud --replicas=1``
+
+## Selve migreringen
+1. Scale ned target apper (kun nødvendig hvis vi faktisk skal flytte data):
+    ```
+   kubectl scale deployment <KILDEAPP> --replicas=0
+   ```
+2. Skru av audit-logging på databasen vi skriver til, slik at vi ikke spammer loggen. DETTE SKAL SKRUS PÅ IGJEN UANSETT UTFALL !!
+3. Ta backup av begge databaser før du begynner. Dette kan du gjøre i GCP.
+4. Finn navn på migreringspod:
+   ```
+   kubectl get pods | grep gcloud
+   ```
+5. Exec inn i pod:
+   ```
+   kubectl exec -it <PODNAVN> -c gcloud -- sh
+   ```
+6. Autentiser servicebrukeren:
+   ```
+   gcloud auth activate-service-account <SERVICE_USER_FULLT_NAVN> --key-file /var/run/secrets/nais.io/migration-user/user
+   ```
+7. Sett prosjekt (ved behov, kjør ``gcloud projects list``):
+    ```
+    gcloud config set project <PROJECT_ID>
+    ```
+8. Finn connection name for kildedatabasen:
+   ```
+   gcloud sql instances describe <KILDEINSTANS> --format="get(connectionName)" --project <PROJECT_ID>
+   ```
+   Eksempel dev:
+   ```
+   gcloud sql instances describe etterlatte-vedtaksvurdering --format="get(connectionName)" --project etterlatte-dev-9b0b
+   ```
+9. Start proxy mot kildedatabasen:
+   ```
+   cloud_sql_proxy -enable_iam_login -instances=<CONNECTION_NAME>=tcp:5432 &
+   ```
+10. Test tilkobling mot kildedatabasen (valgfritt):
+   ```
+   psql -h localhost -p 5432 -U migration-user@etterlatte-dev-9b0b.iam -d <KILDEDATABASE>
+   ```
+11. Dump data fra kildedatabasen:
+   ```
+   pg_dump --format=custom -h localhost -p 5432 -U <USER> -d vedtaksvurdering -f /data/dump-custom.sql --data-only --exclude-table-data=flyway_schema_history && echo "data er dumpet"
+   ```
+12. Drep cloud_sql_proxy for å frigjøre port 5432:
+    ```
+    ls -l /proc/*/exe
+    ```
+    Finn PID fra path (eks. /proc/123/exe betyr PID er 123), kjør deretter:
+    ```
+    kill -9 <PID>
+    ```
+13. Finn connection name for måldatabasen:
+    ```
+    gcloud sql instances describe <MÅLINSTANS> --format="get(connectionName)" --project <PROJECT_ID>
+    ```
+14. Start proxy mot måldatabasen:
+    ```
+    cloud_sql_proxy -enable_iam_login -instances=<CONNECTION_NAME>=tcp:5432 &
+    ```
+15. Last opp data til måldatabasen:
+    ```
+    pg_restore -h localhost -U <USER> -d sakogbehandlinger -p 5432 --data-only /data/dump-custom.sql
+    ```
+16. Slett SQL-dump fra pod:
+    ```
+    rm /data/dump.sql
+    ```
+17. Scale opp kilde- og målapper igjen:
+
+    Dette fordi vi får overvåkningsfeil hvis kildeappen ikke kjører
+    ```
+    kubectl scale deployment <KILDEAPP> --replicas=1
+    kubectl scale deployment <MÅLAPP> --replicas=1
+    ```
+18. Skru på igjen audit-logging
+    Merge PR med audit-logging-properties på i dev|prod.yaml, og (for å få riktig filtrering på hva som skal auditlogges):
+    ```
+    nais postgres enable-audit <MÅLAPP>
+    ```
+
+## Verifisering
+
+Sjekk at audit-logging ble skrudd på:
+```
+nais postgres verify-audit MÅLAPP> --team etterlatte
+```
+Sjekk størrelser på tabeller og indekser i måldatabasen.
+Sjekk at tegnsett ble riktig, at æ, ø og å er som forventet.
+
+Det beste er å sjekke mot egne verdier, men Copilot anbefaler noe som dette:
+```
+SELECT relname AS table_name, pg_size_pretty(pg_total_relation_size(relid)) AS "Total Size", pg_size_pretty(pg_indexes_size(relid)) AS "Index Size", pg_size_pretty(pg_relation_size(relid)) AS "Actual Size" FROM pg_catalog.pg_statio_user_tables ORDER BY pg_total_relation_size(relid) DESC;
 ```
 
-### 5. Apply network policy
-
-For at appen skal kunne kommunisere med andre apper sin database må network policy for pod-en legges til.
-
-Ip'ene som refereres må peke på riktige public ip'er for databasene som skal aksesseres. Dette finner man i oversikten over 
-databaseinstanser i GCP Console. 
-
-Oppdater `network-<dev/prod>.yaml` med riktige ip'er og kjør: 
-
-```shell
-kubectl apply -f network-<dev/prod>.yaml
+## Opprydding
+Når migrering er fullført og verifisert:
 ```
-
-### 6. Restart pod for å få med siste endringer
-Pod-en må startes på nytt for at den skal lese secret og network policy som ble lagt til.
-```shell
-kubectl scale deployment <POD_ID> --replicas=0
-```
-Vent til pod'en er slått av, kjør så:
-```shell
-kubectl scale deployment <POD_ID> --replicas=1
-```
-
-
-### 7. Logg inn og aktiver servicebruker
-
-Exec inn i pod'en:
-```
-kubectl exec -it <POD_ID> -- sh
-```
-
-Aktiver servicebruker: 
-
-```shell
-gcloud auth activate-service-account --key-file /var/run/secrets/nais.io/migration-user/user
-```
-
-Sett prosjekt (miljø) du skal migrere:
-
-```shell
-gcloud config set project <PROJECT_ID>
-```
-
-Instansen er nå klar til å koble seg på databaser og starte migreringen.
-
-## Forarbeid databaser
-Videre guide tar utgangspunkt i at skjemadefinisjoner (DDL) allerede er opprettet i 
-databasen det migreres til. For å hente ut dette kan man kjøre:
-
-```shell
-pg_dump -h localhost -p 5432 -U <BRUKER> -d <DATABASE> --schema-only --exclude-table-data=flyway_schema_history
-```
-
-Det kan være lurt å tenke på om man vi vil legge på indeksene i etterkant da
-insert med hele tabellen sammen med indeksering kan ta lang tid. Sjekk indekstørrelse opp mot tabellstørrelse for 
-å avgjøre dette evt en test i dev/lokalt.
-
-For å kunne lese og skrive til databasene det skal migreres fra og til, må servicebrukeren få tilganger.
-Dette gjøres på følgende måte:
-
-### 1. Gi service-account brukeren tilgang til database-instansene
-Service-account brukeren må legges inn manuelt i brukerseksjonen på database-instansene det skal migreres mellom i cloud console.
-Velg "Add user account" og skriv inn hele brukernavnet (feks `migrering-user@etterlatte-prod-207c.iam.gserviceaccount.com`).
-
-### 2. Sett opp les-tilgang i database det skal migreres fra
-Før migrering må det gis tilgang til skjema og tabeller hvor det skal leses fra:
-```postgresql
-GRANT USAGE on SCHEMA public to "<SERVICEACCOUNT-USER>";
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO "<SERVICEACCOUNT-USER>";
-```
-
-### 3. Sett opp skriv-tilgang i database det skal migreres til
-Videre må det gis tilgang til skjema og tabeller det skal skrives til:
-```postgresql
-GRANT USAGE on SCHEMA public to "<SERVICEACCOUNT-USER>";
-GRANT INSERT ON ALL TABLES IN SCHEMA public TO "<SERVICEACCOUNT-USER>"; 
-```
-
-Alternativt rollen "cloudsqliamserviceaccount"
-
-
-## Uføre migrering
-
-### 1. Koble til proxy
-
-Hent ut instansbeskrivelse fra gcloud:
-
-```shell
-gcloud sql instances describe <APP_NAME> --format="get(connectionName)" --project <PROJECT_ID>
-```
-
-Legg den til i dette kallet for å åpne proxy mot databasen:
-
-```shell
-cloud_sql_proxy -enable_iam_login -instances=<INSTANCE_NAME>=tcp:5432 &
-```
-
-OBS: Denne blir startet i bakgrunnen. For å avslutte den og gå mot annen instans/database må du drepe prosessen. 
-Det kan gjøres ved å kjøre: 
-
-```shell
-ls -l /proc/*/exe
-```
-
-Kjør deretter `kill -9 <PID>`
-
-_Gjeldende PID er tallet som står i stien til cloud_sql_proxy. Eks. `/proc/123/exe` betyr at PID er 123._
-
-### 2. Dump data fra database til pod
-
-```shell
-pg_dump -h localhost -p 5432 -U <MIGRATION_USER> -d <DATABASE_NAME> -f /data/dump.sql --data-only --exclude-table-data=flyway_schema_history
-```
-
-### 3. Gjenopprett dumpet data
-Når data er dumpet til pod kan det gjenopprettes i ønsket database. Først må gjeldende `cloud_sql_proxy` fjernes, og ny proxy settes opp mot
-databasen det skal importeres til som angitt i steg 1.
-
-Videre kan import kjøres på følgende måte:
-```shell
-psql -h localhost -p 5432 -U <MIGRATION_USER> <DATABASE_NAME> -f /data/dump.sql
-```
-
-## Cleanup
-
-Når du er ferdig med migrering kan du kjøre:
-
-```shell
 kubectl delete -f gcloud.yaml
 kubectl delete -f secret.yaml
 kubectl delete -f network-<dev/prod>.yaml
+
+# OBS: Slett secrets som er lagt inn for service-bruker i GCP-console 
+# ENDA MERE OBS: SKRU PÅ AUDITLOGGING!
 ```
 
+## Kjente feil
 
-## Mulige problemer
+#### Feil: "error: invalid command \N"
 
-### Feil ved dump av database
-error: invalid command \N
+Dette er ikke en faktisk \N-feil. Det kan være en tilgangsfeil som skjer tidlig i kjøringen.
+Det du egentlig vil se i loggen er noe slikt:
 
-Dette er ikke den reelle feilen, men kan være at dataene ikke er riktig eksportert eller at man mangler tilgang. 
-Feilen kommer vanligvis helt i starten av kjøringen og kan være vanskelig å se. Eksempel
-```shell
-ERROR:  permission denied for table behandling_versjon
-psql:/data/dump.sql:7662: error: invalid command \.`
-```
+ERROR: permission denied for table behandling_versjon
 
-Løsningen på dette er å gi `cloudsqliamserviceaccount` tilgang til tabellen det feiler for. Se _Forarbeid databaser (steg 2)_. 
+Løsning: Gi cloudsqliamserviceaccount tilgang til tabellen som feiler. Se Forarbeid - Databaser
 
-### Feil ved oppkobling til database 
-```shell
-pg_dump: error: connection to server at "localhost" (127.0.0.1), port 5432 failed: FATAL:  password authentication failed for user "migration-user@etterlatte-prod-207c.iam"
-```
-Dette betyr vanligvis at service-account brukeren ikke er lagt til i database-instansen. Se _Forarbeid databaser (steg 1)_
+#### Feil: "password authentication failed"
 
-### Ikke tilgang til nye tabeller, selv om det er gitt tilgang tidligere
-Dersom nye tabeller er lagt til, må tilganger tildeles på nytt. Se _Forarbeid databaser (steg 2 og steg 3)_.
+Betyr at servicebrukeren ikke er lagt til i database-instansen.
+Løsning: Se Forarbeid - Databaser steg 4.
 
+#### Feil: "Number of retries exceeded while attempting to acquire PostgreSQL advisory lock"
 
-## Øvrig dokumentasjon på confluence
-https://confluence.adeo.no/display/TE/Migreringssteg+for+database
+Skjer hvis to pods prøver å kjøre Flyway-migrering samtidig.
+Løsning: Konfigurer lockRetryCount eller sørg for at kun én pod kjører av gangen.
+
+#### Feil: Ikke tilgang til nye tabeller selv om tilgang er gitt tidligere
+
+Nye tabeller arver ikke eksisterende GRANT. Tilganger må gis på nytt.
+Løsning: Kjør GRANTkommandoene på nytt. Se Forarbeid - Databaser steg 5 og 6.
